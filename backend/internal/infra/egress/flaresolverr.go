@@ -58,7 +58,7 @@ func (flaresolverrSolver) Solve(ctx context.Context, cfg ClearanceConfig, proxyU
 		"maxTimeout": cfg.Timeout.Milliseconds(),
 	}
 	if proxyURL != "" {
-		payload["proxy"] = map[string]string{"url": proxyURL}
+		payload["proxy"] = flaresolverrProxyPayload(proxyURL)
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -149,6 +149,37 @@ func sanitizeFlareSolverrMessage(value string) string {
 		value = string(characters[:300])
 	}
 	return value
+}
+
+// flaresolverrProxyPayload maps a node proxy URL into FlareSolverr's proxy object.
+// FlareSolverr only enables Chrome proxy authentication when username and password
+// are provided as separate fields; credentials embedded in proxy.url are ignored
+// by the --proxy-server path.
+func flaresolverrProxyPayload(proxyURL string) map[string]string {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return map[string]string{"url": proxyURL}
+	}
+	parsed, err := url.Parse(proxyURL)
+	if err != nil || parsed.Host == "" || parsed.User == nil {
+		return map[string]string{"url": proxyURL}
+	}
+	username := parsed.User.Username()
+	password, hasPassword := parsed.User.Password()
+	if username == "" && !hasPassword {
+		return map[string]string{"url": proxyURL}
+	}
+	cleaned := *parsed
+	cleaned.User = nil
+	payload := map[string]string{"url": cleaned.String(), "username": username}
+	// Always include password when any userinfo is present so FlareSolverr takes
+	// the authenticated extension path (it requires all three keys).
+	if hasPassword {
+		payload["password"] = password
+	} else {
+		payload["password"] = ""
+	}
+	return payload
 }
 
 func flaresolverrEndpoint(value string) (string, error) {
