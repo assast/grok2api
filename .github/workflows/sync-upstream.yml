@@ -1,0 +1,60 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # 04:17 Asia/Shanghai (20:17 UTC), before the NC Watchtower check.
+    - cron: "17 20 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream
+        id: merge
+        env:
+          UPSTREAM_REPOSITORY: lij768423-svg/grok2api
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream main
+
+          upstream_head=$(git rev-parse upstream/main)
+          fork_head=$(git rev-parse HEAD)
+          echo "Fork HEAD: $fork_head"
+          echo "Upstream HEAD: $upstream_head"
+
+          if git merge-base --is-ancestor "$upstream_head" HEAD; then
+            echo "No upstream commits to merge."
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git merge --no-edit upstream/main
+          git diff --check
+          git push origin HEAD:main
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+          echo "Merged commit: $(git rev-parse HEAD)"
+
+      - name: Dispatch GHCR image build
+        if: steps.merge.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run assast-ghcr-image.yml --repo "$GITHUB_REPOSITORY" --ref main
