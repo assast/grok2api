@@ -48,6 +48,13 @@ jobs:
           fi
 
           git merge --no-edit upstream/main
+
+          # The parent repository carries a generic ghcr-image.yml. The fork keeps
+          # its customized assast-ghcr-image.yml, so never retain both workflows.
+          if [ -f .github/workflows/ghcr-image.yml ]; then
+            git rm -f .github/workflows/ghcr-image.yml
+          fi
+
           git diff --check
           git push origin HEAD:main
           echo "merged=true" >> "$GITHUB_OUTPUT"
