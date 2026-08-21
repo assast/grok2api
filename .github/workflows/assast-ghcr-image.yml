@@ -133,7 +133,7 @@ jobs:
         id: image
         shell: bash
         run: |
-          image_name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          image_name=$(printf '%s' "$GITHUB_REPOSITORY_OWNER/grok2api-mainli" | tr '[:upper:]' '[:lower:]')
           echo "name=ghcr.io/$image_name" >> "$GITHUB_OUTPUT"
 
       - name: Docker metadata
@@ -185,7 +185,7 @@ jobs:
         id: image
         shell: bash
         run: |
-          image_name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          image_name=$(printf '%s' "$GITHUB_REPOSITORY_OWNER/grok2api-mainli" | tr '[:upper:]' '[:lower:]')
           echo "name=ghcr.io/$image_name" >> "$GITHUB_OUTPUT"
 
       - name: Docker metadata
