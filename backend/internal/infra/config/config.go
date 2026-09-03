@@ -248,6 +248,7 @@ type AuditConfig struct {
 	BatchSize                   int      `yaml:"batchSize"`
 	FlushInterval               Duration `yaml:"flushInterval"`
 	CommitDelay                 Duration `yaml:"commitDelay"`
+	RetentionDays               int      `yaml:"retentionDays"`
 	LedgerMode                  string   `yaml:"ledgerMode"`
 	LedgerFailureThreshold      int      `yaml:"ledgerFailureThreshold"`
 	LedgerUnhealthyGrace        Duration `yaml:"ledgerUnhealthyGrace"`
@@ -295,8 +296,10 @@ type QualityGuardRequestRetryConfig struct {
 	OnExhausted     string   `yaml:"onExhausted"`
 	AccountCooldown Duration `yaml:"accountCooldown"`
 	// IdleAccountCooldown cools an account after a truly empty upstream
-	// stream. Independent of accountCooldown (missing-thinking). Zero uses 24h.
-	IdleAccountCooldown Duration `yaml:"idleAccountCooldown"`
+	// stream. Independent of accountCooldown (missing-thinking). Zero uses 15m.
+	IdleAccountCooldown             Duration `yaml:"idleAccountCooldown"`
+	MinEncryptedBytes               int      `yaml:"minEncryptedBytes"`
+	EncryptedBytesPerReasoningToken int      `yaml:"encryptedBytesPerReasoningToken"`
 }
 
 type ClientKeyDefaultsConfig struct {
@@ -688,6 +691,9 @@ func (c Config) Validate() error {
 	if c.Audit.CommitDelay.Value() < minAuditCommitDelay || c.Audit.CommitDelay.Value() > maxAuditCommitDelay {
 		return errors.New("audit.commitDelay 必须在 1ms 到 50ms 之间")
 	}
+	if c.Audit.RetentionDays < 0 || c.Audit.RetentionDays > 365 {
+		return errors.New("audit.retentionDays 必须在 0 到 365 之间")
+	}
 	if c.Audit.LedgerMode != "observe" && c.Audit.LedgerMode != "enforce" {
 		return errors.New("audit.ledgerMode 必须是 observe 或 enforce")
 	}
@@ -804,6 +810,12 @@ func validateQualityGuardRequestRetry(value QualityGuardRequestRetryConfig) erro
 	}
 	if d := value.IdleAccountCooldown.Value(); d != 0 && (d < time.Minute || d > 168*time.Hour) {
 		return errors.New("qualityGuard.requestRetry.idleAccountCooldown 必须在 1m 到 168h 之间")
+	}
+	if value.MinEncryptedBytes != 0 && (value.MinEncryptedBytes < 64 || value.MinEncryptedBytes > 4096) {
+		return errors.New("qualityGuard.requestRetry.minEncryptedBytes 必须在 64 到 4096 之间")
+	}
+	if value.EncryptedBytesPerReasoningToken != 0 && (value.EncryptedBytesPerReasoningToken < 1 || value.EncryptedBytesPerReasoningToken > 16) {
+		return errors.New("qualityGuard.requestRetry.encryptedBytesPerReasoningToken 必须在 1 到 16 之间")
 	}
 	return nil
 }
@@ -926,21 +938,23 @@ func defaultConfig() Config {
 		},
 		Audit: AuditConfig{
 			BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond), CommitDelay: Duration(5 * time.Millisecond),
-			LedgerMode: "enforce", LedgerFailureThreshold: 1,
+			RetentionDays: 7,
+			LedgerMode:    "enforce", LedgerFailureThreshold: 1,
 			LedgerUnhealthyGrace: Duration(10 * time.Second), LedgerQueueHighWatermarkPct: 90,
 		},
 		QualityGuard: QualityGuardConfig{
 			Enabled: true,
-			Model: "grok-4.6", Mode: "passive",
+			Model:   "grok-4.6", Mode: "passive",
 			ActiveInterval: Duration(30 * time.Minute), PassivePollInterval: Duration(5 * time.Second),
 			SoftTPS: 500, HardTPS: 2500, ConsecutiveSoft: 2, ConsecutiveErrors: 2,
 			QuarantineDuration: Duration(5 * time.Minute), NoAccountBackoff: Duration(5 * time.Minute),
 			MinimumHealthyNodes: 1, MaxOutputTokens: 384,
 			MinimumGenerationWindow: Duration(time.Second), RotationTimeout: Duration(45 * time.Second),
 			RequestRetry: QualityGuardRequestRetryConfig{
-				Enabled: true,
+				Enabled:     true,
 				MaxAttempts: 6, HoldTimeout: Duration(30 * time.Second), MinOutputTokens: 8, OnExhausted: "fail_closed",
 				AccountCooldown: Duration(12 * time.Hour), IdleAccountCooldown: Duration(15 * time.Minute),
+				MinEncryptedBytes: 256, EncryptedBytesPerReasoningToken: 4,
 			},
 		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},

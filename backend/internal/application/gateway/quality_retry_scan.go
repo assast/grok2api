@@ -14,24 +14,32 @@ import (
 )
 
 const (
-	qualityProtocolChat        = "chat"
-	qualityProtocolResponses   = "responses"
-	qualityProtocolAnthropic   = "anthropic"
-	qualityReasoningSSEComment = ": grok2api-reasoning-start"
-	qualityHoldMaxBufferBytes  = 4 << 20
+	qualityProtocolChat                = "chat"
+	qualityProtocolResponses           = "responses"
+	qualityProtocolAnthropic           = "anthropic"
+	qualityReasoningSSEComment         = ": grok2api-reasoning-start"
+	qualityReasoningEvidenceSSEComment = ": grok2api-reasoning-evidence"
+	qualityHoldMaxBufferBytes          = 4 << 20
 )
 
 type qualityScanState struct {
-	protocol         string
-	pending          []byte
-	hasThinking      bool
-	reasoningStarted bool
-	visibleRunes     int
-	reasoningTokens  int64
-	outputTokens     int64
-	usage            Usage
-	responseID       string
-	terminal         bool
+	protocol                        string
+	pending                         []byte
+	hasThinking                     bool
+	reasoningStarted                bool
+	visibleRunes                    int
+	aggregateRunes                  int
+	semanticOutput                  bool
+	reasoningTokens                 int64
+	outputTokens                    int64
+	encryptedBytes                  int
+	minEncryptedBytes               int
+	encryptedBytesPerReasoningToken int
+	usage                           Usage
+	responseID                      string
+	terminal                        bool
+	holdExpired                     bool
+	firstVisibleAt                  time.Time
 }
 
 type qualityReadResult struct {
@@ -126,7 +134,8 @@ func qualityProtocolForOperation(operation audit.Operation) string {
 }
 
 func (s *qualityScanState) signals() QualityStreamSignals {
-	visible := int64((s.visibleRunes + 3) / 4)
+	visibleRunes := max(s.visibleRunes, s.aggregateRunes)
+	visible := int64((visibleRunes + 3) / 4)
 	if s.usage.Reported {
 		fromUsage := s.usage.OutputTokens - s.usage.ReasoningTokens
 		if fromUsage > visible {
@@ -140,13 +149,27 @@ func (s *qualityScanState) signals() QualityStreamSignals {
 	// Usage.reasoning_tokens is not proof of thinking. 降智 accounts report
 	// hundreds of reasoning tokens on completed while the stream never sent
 	// reasoning_text / reasoning_summary deltas (TUI shows no thoughts).
+	// A non-empty encrypted_content stub is also not thinking until it meets
+	// the ciphertext floor (default 256 bytes, or 4 bytes per reasoning token).
+	reasoningTokens := max(s.reasoningTokens, s.usage.ReasoningTokens)
+	floor := encryptedThinkingFloor(s.minEncryptedBytes, s.encryptedBytesPerReasoningToken, reasoningTokens)
+	hasThinking := s.hasThinking || s.encryptedBytes >= floor
+	firstVisible := !s.firstVisibleAt.IsZero()
+	var flushMS int64
+	if firstVisible {
+		flushMS = time.Since(s.firstVisibleAt).Milliseconds()
+	}
 	return QualityStreamSignals{
-		HasThinking:      s.hasThinking,
-		ReasoningStarted: s.reasoningStarted || s.hasThinking,
+		HasThinking:      hasThinking,
+		ReasoningStarted: s.reasoningStarted || hasThinking,
 		VisibleTokens:    visible,
-		ReasoningTokens:  max(s.reasoningTokens, s.usage.ReasoningTokens),
+		ReasoningTokens:  reasoningTokens,
 		OutputTokens:     output,
+		EncryptedBytes:   s.encryptedBytes,
+		FirstVisible:     firstVisible,
+		VisibleFlushMS:   flushMS,
 		Terminal:         s.terminal,
+		HoldExpired:      s.holdExpired,
 	}
 }
 
@@ -173,6 +196,13 @@ func ObserveQualityChunk(state *qualityScanState, chunk []byte) {
 		if bytes.Equal(line, []byte(qualityReasoningSSEComment)) {
 			// Timing stub only. 降智 still emits this, then usage.reasoning_tokens=0.
 			state.reasoningStarted = true
+			continue
+		}
+		if bytes.Equal(line, []byte(qualityReasoningEvidenceSSEComment)) {
+			// Protocol converters cannot expose encrypted_content in every public
+			// JSON contract. This internal SSE comment preserves that evidence.
+			state.reasoningStarted = true
+			state.hasThinking = true
 			continue
 		}
 		if !bytes.HasPrefix(line, []byte("data:")) {
@@ -208,6 +238,8 @@ func observeQualityChat(state *qualityScanState, payload []byte) {
 				Reasoning        string `json:"reasoning"`
 				ReasoningContent string `json:"reasoning_content"`
 				ThinkingContent  string `json:"thinking_content"`
+				ToolCalls        []any  `json:"tool_calls"`
+				FunctionCall     any    `json:"function_call"`
 			} `json:"delta"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -238,11 +270,14 @@ func observeQualityChat(state *qualityScanState, payload []byte) {
 	}
 	for _, choice := range event.Choices {
 		delta := choice.Delta
-		if delta.Reasoning != "" || delta.ReasoningContent != "" || delta.ThinkingContent != "" {
+		if strings.TrimSpace(delta.Reasoning) != "" || strings.TrimSpace(delta.ReasoningContent) != "" || strings.TrimSpace(delta.ThinkingContent) != "" {
 			state.hasThinking = true
 		}
 		if delta.Content != "" {
 			noteVisibleContent(state, delta.Content)
+		}
+		if len(delta.ToolCalls) > 0 || delta.FunctionCall != nil {
+			state.semanticOutput = true
 		}
 		if choice.FinishReason != "" {
 			state.terminal = true
@@ -250,34 +285,43 @@ func observeQualityChat(state *qualityScanState, payload []byte) {
 	}
 }
 
-type qualityReasoningItem struct {
+type qualityResponsesOutputItem struct {
 	ID               string `json:"id"`
 	Type             string `json:"type"`
 	EncryptedContent string `json:"encrypted_content"`
+	Content          []struct {
+		Type    string `json:"type"`
+		Text    string `json:"text"`
+		Refusal string `json:"refusal"`
+	} `json:"content"`
 }
 
-func noteResponsesReasoningItem(state *qualityScanState, item qualityReasoningItem) {
+func noteEncryptedBytes(state *qualityScanState, blob string) {
+	if n := len(strings.TrimSpace(blob)); n > state.encryptedBytes {
+		state.encryptedBytes = n
+	}
+}
+
+func noteResponsesReasoningItem(state *qualityScanState, item qualityResponsesOutputItem) {
 	if !strings.EqualFold(strings.TrimSpace(item.Type), "reasoning") {
 		return
 	}
 	if strings.TrimSpace(item.ID) != "" {
 		state.reasoningStarted = true
 	}
-	if strings.TrimSpace(item.EncryptedContent) != "" {
-		state.hasThinking = true
-	}
+	noteEncryptedBytes(state, item.EncryptedContent)
 }
 
 func observeQualityResponses(state *qualityScanState, payload []byte) {
 	var event struct {
-		Type  string `json:"type"`
-		Delta string `json:"delta"`
-		Item  qualityReasoningItem
+		Type     string                     `json:"type"`
+		Delta    string                     `json:"delta"`
+		Item     qualityResponsesOutputItem `json:"item"`
 		Response *struct {
-			ID     string                 `json:"id"`
-			Model  string                 `json:"model"`
-			Output []qualityReasoningItem `json:"output"`
-			Usage *struct {
+			ID     string                       `json:"id"`
+			Model  string                       `json:"model"`
+			Output []qualityResponsesOutputItem `json:"output"`
+			Usage  *struct {
 				OutputTokens        int64 `json:"output_tokens"`
 				InputTokens         int64 `json:"input_tokens"`
 				TotalTokens         int64 `json:"total_tokens"`
@@ -294,14 +338,19 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 	case "response.completed", "response.incomplete", "response.failed":
 		state.terminal = true
 	case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
-		if event.Delta != "" {
+		if strings.TrimSpace(event.Delta) != "" {
 			state.hasThinking = true
 		}
 	case "response.output_item.added", "response.output_item.done":
 		noteResponsesReasoningItem(state, event.Item)
+		state.aggregateRunes = max(state.aggregateRunes, observeQualityResponsesOutputItem(state, event.Item))
 	case "response.output_text.delta":
 		if event.Delta != "" {
 			noteVisibleContent(state, event.Delta)
+		}
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta", "response.mcp_call_arguments.delta":
+		if event.Delta != "" {
+			state.semanticOutput = true
 		}
 	}
 	if event.Response != nil {
@@ -321,7 +370,43 @@ func observeQualityResponses(state *qualityScanState, payload []byte) {
 			state.outputTokens = event.Response.Usage.OutputTokens
 			state.reasoningTokens = event.Response.Usage.OutputTokensDetails.ReasoningTokens
 		}
+		aggregateRunes := 0
+		for _, item := range event.Response.Output {
+			aggregateRunes += observeQualityResponsesOutputItem(state, item)
+		}
+		state.aggregateRunes = max(state.aggregateRunes, aggregateRunes)
 	}
+}
+
+func observeQualityResponsesOutputItem(state *qualityScanState, item qualityResponsesOutputItem) int {
+	if state == nil {
+		return 0
+	}
+	visibleRunes := 0
+	switch item.Type {
+	case "", "reasoning":
+		return 0
+	case "message":
+		for _, content := range item.Content {
+			text := content.Text
+			if text == "" {
+				text = content.Refusal
+			}
+			if text != "" {
+				visibleRunes += utf8.RuneCountInString(text)
+				state.semanticOutput = true
+				continue
+			}
+			if content.Type != "" && content.Type != "output_text" && content.Type != "refusal" {
+				state.semanticOutput = true
+			}
+		}
+	default:
+		// Function, shell, MCP and other call items are meaningful output even
+		// when the provider omits usage and argument-delta events.
+		state.semanticOutput = true
+	}
+	return visibleRunes
 }
 
 func observeQualityAnthropic(state *qualityScanState, payload []byte) {
@@ -329,11 +414,15 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 		Type         string `json:"type"`
 		ContentBlock struct {
 			Type string `json:"type"`
+			Text string `json:"text"`
+			Data string `json:"data"`
 		} `json:"content_block"`
 		Delta struct {
-			Type     string `json:"type"`
-			Text     string `json:"text"`
-			Thinking string `json:"thinking"`
+			Type        string `json:"type"`
+			Text        string `json:"text"`
+			Thinking    string `json:"thinking"`
+			PartialJSON string `json:"partial_json"`
+			Signature   string `json:"signature"`
 		} `json:"delta"`
 		Usage *struct {
 			OutputTokens        int64 `json:"output_tokens"`
@@ -349,15 +438,36 @@ func observeQualityAnthropic(state *qualityScanState, payload []byte) {
 	case "message_stop":
 		state.terminal = true
 	case "content_block_start":
-		if event.ContentBlock.Type == "thinking" {
+		switch event.ContentBlock.Type {
+		case "thinking":
 			state.reasoningStarted = true
+		case "redacted_thinking":
+			state.reasoningStarted = true
+			noteEncryptedBytes(state, event.ContentBlock.Data)
+		case "text":
+			if event.ContentBlock.Text != "" {
+				noteVisibleContent(state, event.ContentBlock.Text)
+				state.semanticOutput = true
+			}
+		case "":
+		default:
+			state.semanticOutput = true
 		}
 	case "content_block_delta":
-		if event.Delta.Type == "thinking_delta" && event.Delta.Thinking != "" {
+		if event.Delta.Type == "thinking_delta" && strings.TrimSpace(event.Delta.Thinking) != "" {
 			state.hasThinking = true
+		}
+		if event.Delta.Type == "signature_delta" && strings.TrimSpace(event.Delta.Signature) != "" {
+			// Anthropic Messages represents Responses encrypted_content as a
+			// signature delta. Length is judged against the ciphertext floor.
+			state.reasoningStarted = true
+			noteEncryptedBytes(state, event.Delta.Signature)
 		}
 		if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
 			noteVisibleContent(state, event.Delta.Text)
+		}
+		if event.Delta.Type == "input_json_delta" && event.Delta.PartialJSON != "" {
+			state.semanticOutput = true
 		}
 	}
 	if event.Usage != nil {
@@ -373,6 +483,9 @@ func noteVisibleContent(state *qualityScanState, text string) {
 	if text == "" {
 		return
 	}
+	if state.firstVisibleAt.IsZero() {
+		state.firstVisibleAt = time.Now()
+	}
 	state.visibleRunes += utf8.RuneCountInString(text)
 }
 
@@ -382,7 +495,11 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 		return io.NopCloser(bytes.NewReader(nil)), QualityWait, Usage{}, "", errQualityEmptyStream
 	}
 	pump := newQualityReadPump(body)
-	state := qualityScanState{protocol: protocol}
+	state := qualityScanState{
+		protocol:                        protocol,
+		minEncryptedBytes:               cfg.MinEncryptedBytes,
+		encryptedBytesPerReasoningToken: cfg.EncryptedBytesPerReasoningToken,
+	}
 	var held bytes.Buffer
 	holdTimer := time.NewTimer(cfg.HoldTimeout)
 	defer holdTimer.Stop()
@@ -403,6 +520,7 @@ func peekQualityStream(ctx context.Context, body io.ReadCloser, protocol string,
 			_ = pump.Close()
 			return io.NopCloser(bytes.NewReader(held.Bytes())), QualityWait, state.usage, state.responseID, qualityPeekAbortError(ctx, ctx.Err())
 		case <-holdTimer.C:
+			state.holdExpired = true
 			sig.HoldExpired = true
 			if verdict := ClassifyQualityHold(sig, cfg.MinOutputTokens); verdict != QualityWait {
 				return newPrefixReplay(&held, pump), verdict, state.usage, state.responseID, nil
@@ -442,6 +560,9 @@ func finishQualityPeek(held *bytes.Buffer, pump *qualityReadPump, state *quality
 	state.terminal = true
 	signals := state.signals()
 	if !signals.HasThinking && signals.ReasoningTokens <= 0 && signals.OutputTokens <= 0 && signals.VisibleTokens <= 0 {
+		if state.semanticOutput {
+			return newPrefixReplay(held, pump), QualityDeliver, state.usage, state.responseID, nil
+		}
 		return newPrefixReplay(held, pump), QualityWait, state.usage, state.responseID, errQualityEmptyStream
 	}
 	return newPrefixReplay(held, pump), ClassifyQualityHold(signals, cfg.MinOutputTokens), state.usage, state.responseID, nil
