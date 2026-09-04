@@ -24,7 +24,39 @@
 > Check out [DEEIX-AI / DEEIX-Chat](https://github.com/DEEIX-AI/DEEIX-Chat), a lightweight, integrated AI platform for model routing, chat, files, tools, billing, identity, and operations.
 
 > [!NOTE]
-> **This fork (lij768423-svg/grok2api) is out of the box.** Official latest plus `qualityGuard` / `requestRetry` ON: 30s hold, minOutput 8, ciphertext floor 256B / reasoning×4, burst (hold-expired short greetings and floor-met dumps still withheld), TUI follow-ups / hosted tools held, 12h missing-thinking cooldown, 15m idle. `docker compose up -d --build` starts the sidecar. Do not pull `ghcr.io/chenyme/grok2api:latest` (same numbers, intercept off). Upstream: [chenyme#1013](https://github.com/chenyme/grok2api/pull/1013) floor, [chenyme#1015](https://github.com/chenyme/grok2api/pull/1015) TUI hold — do not include this fork's `enabled: true`.
+> **This fork (lij768423-svg/grok2api) is out of the box.** Official latest plus `qualityGuard` / `requestRetry` ON. Current lab release is **v3.1.7-lab** — see What's new below. `docker compose up -d --build` starts the sidecar. Do not pull `ghcr.io/chenyme/grok2api:latest` (same numbers, intercept off). Upstream: [chenyme#1013](https://github.com/chenyme/grok2api/pull/1013) floor, [chenyme#1015](https://github.com/chenyme/grok2api/pull/1015) TUI hold — do not include this fork's `enabled: true`.
+
+## What's new (v3.1.7-lab)
+
+Relative to **v3.1.6-lab**. Images: `ghcr.io/lij768423-svg/grok2api:v3.1.7-lab`, `ghcr.io/lij768423-svg/grok2api-quality-guard:v3.1.7-lab` (`latest` follows).
+
+v3.1.6 already had: 30s hold, ciphertext floor 256B / reasoning×4, burst (hold-expired short greetings and floor-met short dumps), TUI follow-ups / hosted tools held, 12h missing-thinking, 15m idle. This release covers two leaks that were already running on the lab boxes.
+
+### 1. Fake encrypted thinking
+
+Degraded accounts emit a legitimate-looking `encrypted_content` / `usage.reasoning_tokens` blob so the gate treats it as thinking and releases, then dump the whole answer in one or two seconds. v3.1.6 let that through.
+
+| Pattern | v3.1.6 | v3.1.7 |
+|---|---|---|
+| Short stub `gAAAA-cipher`, hold-expired "你好" | withheld | withheld (unchanged) |
+| Release as soon as ciphertext meets the floor | released | **keep waiting** until visible text has streamed 2s, or the stream ends |
+| No plaintext reasoning; ciphertext / billing look fine; full answer flushes in &lt;2s | released | **withheld, rotate** |
+| Cipher met floor, `reasoning_tokens=0`, visible text drooling (128k TUI loop) | released | **withheld, rotate** |
+| Withhold while usage is still 0 (empty / short hold) | missing-thinking cooldown (1.5h on lab) | **idle 15m**, so one TUI turn does not burn a row of accounts |
+
+Real plaintext reasoning / summary deltas still release immediately.
+
+### 2. Codex MCP schema compatibility
+
+Codex Desktop injects MCP tool `codex_app.automation_update` (upstream name `mcp__codex_app__automation_update`). Its JSON Schema root is `anyOf` / `oneOf` with a non-object branch. Grok Build returns `400 invalid-argument: tool parameter root must be an object type`.
+
+Rewrite before forwarding, narrowly:
+
+- Name matches `codex_app.automation_update` / `codex_app__automation_update`: replace parameters with a loose object (`additionalProperties: true`, `strict=false`)
+- Any other function whose root `anyOf`/`oneOf` has a non-object branch (`$ref`, null, …): same loose object, so the whole request is not rejected
+- **Unchanged**: top-level `automation_update`, other namespaces, shell / apply_patch, nested `anyOf`
+
+Claude CLI and ordinary functions are untouched. Codex → grok-4.6 can reach upstream; that automation MCP loses its strict schema; coding tools pass through as-is.
 
 ## One-shot install prompt
 
@@ -41,6 +73,8 @@ This fork is out of the box: official latest + missing-thinking intercept ON.
 - hold 30s / minOutput 8 / 6 attempts / fail_closed
 - short encrypted_content stubs are not thinking; floor = max(256B, reasoning_tokens×4)
 - hold-expired short greeting + high reasoning still withheld
+- fake-enc dump (<2s full-answer flush, no plaintext reasoning) withheld; cipher-only waits 2s
+- Codex MCP root anyOf/oneOf schemas simplified for Grok Build
 - 12h missing-thinking cooldown, 15m idle; compose up -d starts the sidecar
 
 Use every residential sticky: one Mihomo listener + one Grok2API node per session.
