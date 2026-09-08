@@ -166,14 +166,27 @@ func encryptedThinkingFloor(minBytes, bytesPerToken int, reasoningTokens int64) 
 	return floor
 }
 
+func qualityFastFlush(sig QualityStreamSignals, limitMS int64) bool {
+	return sig.FirstVisible && sig.VisibleFlushMS >= 0 && sig.VisibleFlushMS < limitMS
+}
+
+func qualityMeetsEncryptedFloor(sig QualityStreamSignals) bool {
+	if sig.EncryptedBytes <= 0 {
+		return false
+	}
+	return sig.EncryptedBytes >= encryptedThinkingFloor(0, 0, sig.ReasoningTokens)
+}
+
+func qualityHasDumpBill(sig QualityStreamSignals) bool {
+	return sig.ReasoningTokens >= defaultBurstMinReasoning || qualityMeetsEncryptedFloor(sig)
+}
+
 func qualityIsBurstDump(sig QualityStreamSignals, minOutput int64) bool {
+	_ = minOutput
 	if sig.PlaintextThinking {
 		return false
 	}
 	visible := sig.VisibleTokens
-	floor := encryptedThinkingFloor(0, 0, sig.ReasoningTokens)
-	barelyCipher := sig.EncryptedBytes > 0 && sig.EncryptedBytes < floor*2
-	flushed := sig.FirstVisible && sig.VisibleFlushMS >= 0 && sig.VisibleFlushMS < defaultBurstFlushMS
 	heavyReasoning := sig.ReasoningTokens >= defaultBurstMinReasoning
 	shortVisible := visible > 0 && visible < defaultBurstMaxVisible
 	// Hold timed out, then a short greeting dumped with a large reasoning bill
@@ -181,38 +194,43 @@ func qualityIsBurstDump(sig QualityStreamSignals, minOutput int64) bool {
 	if sig.HoldExpired && shortVisible && heavyReasoning {
 		return true
 	}
-	// Cipher met the floor so HasThinking is true, but visible tokens then
-	// dump in <1s with almost no answer (148 out / 140 reasoning in 0.7s).
-	if flushed && shortVisible && heavyReasoning {
-		return true
-	}
-	if barelyCipher && flushed && (visible >= minOutput || heavyReasoning) {
+	if qualityFastFlush(sig, defaultBurstFlushMS) && qualityHasDumpBill(sig) {
 		return true
 	}
 	return false
 }
 
-// qualityIsFakeEncryptedDump is the 18190 screenshot pattern: no plaintext
-// reasoning deltas, ciphertext / usage.reasoning_tokens look legitimate,
-// then the whole answer arrives in a short flush (first-token ≈ duration).
+// qualityIsFakeEncryptedDump is the 18190 / 18183 dump: ciphertext or a
+// large reasoning bill, then the visible answer arrives in <2s. Visible
+// token count is not a gate — vis<8 chat dumps were leaking on minOutput.
 func qualityIsFakeEncryptedDump(sig QualityStreamSignals, minOutput int64) bool {
+	_ = minOutput
 	if sig.PlaintextThinking {
 		return false
 	}
-	if minOutput <= 0 {
-		minOutput = defaultQualityMinOutput
-	}
-	if sig.VisibleTokens < minOutput {
+	if !qualityFastFlush(sig, defaultFakeEncFlushMS) {
 		return false
 	}
-	flushed := sig.FirstVisible && sig.VisibleFlushMS >= 0 && sig.VisibleFlushMS < defaultFakeEncFlushMS
-	if !flushed {
+	return qualityHasDumpBill(sig)
+}
+
+// qualityIsFastReasoningRatioDump catches plaintext thinking that is still a
+// 1ms dump: billed reasoning is ≥80% of output and the visible flush is <2s.
+func qualityIsFastReasoningRatioDump(sig QualityStreamSignals) bool {
+	if !sig.PlaintextThinking {
 		return false
 	}
-	if sig.ReasoningTokens >= defaultBurstMinReasoning || sig.EncryptedBytes >= defaultMinEncryptedBytes {
-		return true
+	if !qualityFastFlush(sig, defaultFakeEncFlushMS) {
+		return false
 	}
-	return false
+	output := sig.OutputTokens
+	if output <= 0 {
+		output = sig.VisibleTokens + sig.ReasoningTokens
+	}
+	if output <= 0 || sig.ReasoningTokens <= 0 {
+		return false
+	}
+	return sig.ReasoningTokens*5 >= output*4
 }
 
 // qualityIsCipherDrool is the 128k TUI status-loop: ciphertext met the
@@ -243,10 +261,10 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
+	if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) || qualityIsFastReasoningRatioDump(sig) {
+		return QualityWithhold
+	}
 	if sig.HasThinking {
-		if qualityIsBurstDump(sig, minOutput) || qualityIsCipherDrool(sig, minOutput) || qualityIsFakeEncryptedDump(sig, minOutput) {
-			return QualityWithhold
-		}
 		if sig.PlaintextThinking {
 			return QualityDeliver
 		}
