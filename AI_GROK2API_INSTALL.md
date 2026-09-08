@@ -21,6 +21,7 @@ https://github.com/lij768423-svg/grok2api/blob/main/AI_GROK2API_INSTALL.md
 - hold 30s / minOutput 8 / 6 枪 / fail_closed
 - 短 encrypted_content stub 不算思考；floor = max(256B, reasoning_tokens×4)
 - hold 到期后的短问候 + 高 reasoning（「你好」）继续扣；floor 达标但 1 秒内吐短回复也扣
+- vis&lt;8 / 明文倒灌：flush &lt;2s 且 reasoning/output ≥ 0.8 仍扣；可见字只数流式 content
 - TUI 续聊（previous_response_id）和 hosted tools 仍 hold，扣住后换号
 - 缺思考冷却 12h，空流 15m；docker compose up -d 带 sidecar
 
